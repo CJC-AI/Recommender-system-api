@@ -4,10 +4,14 @@ __pycache__/
 *$py.class
 
 # Data
-data/*
-data/processed/
+data/raw/
+
+# Ignore everything inside processed
 data/processed/*
-data/processed/interactions.csv
+
+# But keep interactions.csv
+!data/processed/
+!data/processed/interactions.csv
 
 # C extensions
 *.so
