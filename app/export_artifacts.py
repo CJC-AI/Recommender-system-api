@@ -3,19 +3,13 @@ import joblib
 import pandas as pd
 from pathlib import Path
 
-# --- Path Resolution with Pathlib ---
-# __file__ is app/export_artifacts.py
-# .parent is app/
-# .parent.parent is the root directory (RECOMMENDER-SYSTEM-API)
+# --- Path Resolution ---
 BASE_DIR = Path(__file__).resolve().parent.parent
-
-# Add root directory to sys.path so Python can find the 'src' module
 sys.path.append(str(BASE_DIR))
 
 from src.ranking.infer import RankingContext
 from src.ranking.evaluation import time_based_split
 
-# Define paths
 INTERACTIONS_PATH = BASE_DIR / "data" / "processed" / "interactions.csv"
 API_ARTIFACTS_DIR = BASE_DIR / "artifacts" / "api"
 
@@ -25,16 +19,29 @@ def export_api_artifacts():
         raise FileNotFoundError(f"Cannot find data at {INTERACTIONS_PATH}")
         
     interactions = pd.read_csv(INTERACTIONS_PATH)
+    
+    # =====================================================================
+    # MEMORY OPTIMIZATION FOR RENDER FREE TIER (512MB LIMIT)
+    # =====================================================================
+    print(f"  Original size: {len(interactions):,} rows.")
+    
+    # Sort by time to keep the most recent data
+    interactions['last_interaction_ts'] = pd.to_datetime(interactions['last_interaction_ts'])
+    interactions = interactions.sort_values('last_interaction_ts')
+    
+    # Keep only the last 250,000 interactions to strictly ensure it fits in 512MB RAM
+    interactions = interactions.tail(250000).copy()
+    print(f"  Truncated size: {len(interactions):,} rows.")
+    # =====================================================================
+
     train_df, _ = time_based_split(interactions)
     
-    print("2. Building RankingContext (This takes heavy CPU & RAM)...")
+    print("2. Building RankingContext...")
     ctx = RankingContext(train_df)
     
     print(f"3. Exporting lightweight artifacts to {API_ARTIFACTS_DIR}...")
-    # Create the directory if it doesn't exist (equivalent to os.makedirs(..., exist_ok=True))
     API_ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
     
-    # Dump dictionaries with compression
     joblib.dump(ctx.similarity_matrix, API_ARTIFACTS_DIR / "similarity_matrix.joblib", compress=3)
     joblib.dump(ctx.taxonomy_engine, API_ARTIFACTS_DIR / "taxonomy_engine.joblib", compress=3)
     joblib.dump(ctx.item_categories, API_ARTIFACTS_DIR / "item_categories.joblib", compress=3)
@@ -45,7 +52,14 @@ def export_api_artifacts():
     joblib.dump(ctx.user_last_ts, API_ARTIFACTS_DIR / "user_last_ts.joblib", compress=3)
     joblib.dump(ctx.max_train_ts, API_ARTIFACTS_DIR / "max_train_ts.joblib")
     
-    print("Export Complete! Fast inference artifacts are ready.")
+    print("\nExport Complete! Fast inference artifacts are ready.")
+    
+    # Print out some valid user IDs so you know who to test with!
+    valid_users = list(ctx.user_histories.keys())[:5]
+    print("\n" + "="*50)
+    print(f"SUCCESS! When testing your API on Render, use one of these User IDs:")
+    print(valid_users)
+    print("="*50)
 
 if __name__ == "__main__":
     export_api_artifacts()
