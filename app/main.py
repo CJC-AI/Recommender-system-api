@@ -1,133 +1,88 @@
-import time
-import logging
-import pandas as pd
-import os
+import sys
+import joblib
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 from typing import List
 from pathlib import Path
 
-# Import your existing logic
-# We assume the app is run from the root, so src. is accessible
-from src.ranking.infer import RankingContext, load_model, infer
+# --- Path Resolution with Pathlib ---
+BASE_DIR = Path(__file__).resolve().parent.parent
+sys.path.append(str(BASE_DIR))
 
-# --- Configuration ---
-# distinct paths for interactions and model artifacts
-BASE_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = BASE_DIR.parent  # move one level up from /app
+from src.ranking.infer import load_model, infer
 
-INTERACTIONS_PATH = PROJECT_ROOT / "data" / "processed" / "interactions.csv"
-MODEL_PATH = PROJECT_ROOT / "artifacts" / "models" / "lr_ranker.joblib"
+# Define paths
+MODEL_PATH = BASE_DIR / "artifacts" / "models" / "lr_ranker.joblib"
+API_ARTIFACTS_DIR = BASE_DIR / "artifacts" / "api"
 
-# Logging Setup
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("recsys_api")
-
-# --- Global State ---
-# We store heavy objects here so they are loaded only once
-ml_context = {}
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """
-    Load model artifacts and data context on startup.
-    """
-    logger.info("Loading RankingContext and Models...")
-    
-    # 1. Load Data
-    if not INTERACTIONS_PATH.exists():
-        logger.error(f"Interactions file not found at {INTERACTIONS_PATH}")
-        raise FileNotFoundError("Critical data missing.")
-        
-    df = pd.read_csv(INTERACTIONS_PATH)
-    
-    # 2. Build Context (Sim Matrix, Taxonomy, Popularity)
-    # This might take a few seconds/minutes depending on data size
-    ctx = RankingContext(df)
-    
-    # 3. Load Model
-    if not MODEL_PATH.exists():
-        logger.error(f"Model file not found at {MODEL_PATH}")
-        raise FileNotFoundError("Critical model missing.")
-        
-    model = load_model(str(MODEL_PATH))
-    
-    # Store in global state
-    ml_context["ctx"] = ctx
-    ml_context["model"] = model
-    
-    logger.info("System Ready!")
-    yield
-    # (Cleanup code goes here if needed)
-    ml_context.clear()
-
-# Initialize App
-app = FastAPI(title="Recommender System API", lifespan=lifespan)
-
-# --- Pydantic Models (Input/Output Validation) ---
-class RecommendRequest(BaseModel):
+# --- Pydantic Schemas ---
+class RecommendationRequest(BaseModel):
     user_id: int
-    k: int = 10
+    n_candidates: int = 100
+    top_k: int = 10
 
-class RecommendResponse(BaseModel):
+class RecommendationResponse(BaseModel):
     user_id: int
     recommendations: List[int]
-    latency_ms: float
 
-# --- Middleware: Latency Logging ---
-@app.middleware("http")
-async def add_process_time_header(request: Request, call_next):
-    start_time = time.time()
-    response = await call_next(request)
-    process_time = (time.time() - start_time) * 1000
+# --- Lightweight Context Class ---
+class LoadedRankingContext:
+    """A memory-efficient class that mimics RankingContext using pre-computed dicts."""
+    def __init__(self, artifacts_dir: Path):
+        print("Loading pre-computed dictionaries into memory...")
+        # joblib natively supports pathlib.Path objects
+        self.similarity_matrix      = joblib.load(artifacts_dir / "similarity_matrix.joblib")
+        self.taxonomy_engine        = joblib.load(artifacts_dir / "taxonomy_engine.joblib")
+        self.item_categories        = joblib.load(artifacts_dir / "item_categories.joblib")
+        self.user_category_profiles = joblib.load(artifacts_dir / "user_category_profiles.joblib")
+        self.item_stats_dict        = joblib.load(artifacts_dir / "item_stats_dict.joblib")
+        self.top_popular_items      = joblib.load(artifacts_dir / "top_popular_items.joblib")
+        self.user_histories         = joblib.load(artifacts_dir / "user_histories.joblib")
+        self.user_last_ts           = joblib.load(artifacts_dir / "user_last_ts.joblib")
+        self.max_train_ts           = joblib.load(artifacts_dir / "max_train_ts.joblib")
+        print("Dictionaries loaded successfully.")
+
+# --- Lifespan Manager ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print("Starting Lightweight API...")
     
-    # Log latency for every request
-    logger.info(f"Path: {request.url.path} | Latency: {process_time:.2f}ms")
-    response.headers["X-Process-Time"] = str(process_time)
-    return response
+    # 1. Load Pre-computed Data structures (Fast & Low RAM)
+    if not API_ARTIFACTS_DIR.exists():
+        raise FileNotFoundError(f"API artifacts missing. Run app/export_artifacts.py first! Looked in: {API_ARTIFACTS_DIR}")
+        
+    app.state.ctx = LoadedRankingContext(API_ARTIFACTS_DIR)
+    
+    # 2. Load Model
+    # Explicitly casting to string because some underlying XGBoost/Sklearn 
+    # load utilities in older versions prefer strings over Path objects.
+    if not MODEL_PATH.exists():
+        raise FileNotFoundError(f"Model file not found at {MODEL_PATH}")
+        
+    app.state.model = load_model(str(MODEL_PATH))
+    
+    print("Engine Ready. API is accepting requests.")
+    yield
 
-# --- Endpoints ---
+# --- App Definition ---
+app = FastAPI(title="RetailRocket Recommender API", lifespan=lifespan)
 
 @app.get("/health")
 def health_check():
-    """Simple check to see if API is alive"""
-    if not ml_context:
-        raise HTTPException(status_code=503, detail="Model not initialized")
-    return {"status": "healthy", "model_loaded": True}
+    return {"status": "healthy"}
 
-@app.post("/recommend", response_model=RecommendResponse)
-def get_recommendations(payload: RecommendRequest):
-    """
-    Generate recommendations for a specific user.
-    """
-    start = time.time()
-    
+@app.post("/recommend", response_model=RecommendationResponse)
+def get_recommendations(request: RecommendationRequest, req: Request):
     try:
-        # Retrieve loaded artifacts
-        ctx = ml_context["ctx"]
-        model = ml_context["model"]
-        
-        # Run Inference
         recs = infer(
-            user_id=payload.user_id,
-            ctx=ctx,
-            model=model,
-            k=payload.k
+            user_id=request.user_id,
+            ctx=req.app.state.ctx,
+            model=req.app.state.model,
+            n_candidates=request.n_candidates,
+            k=request.top_k
         )
-        
-        latency = (time.time() - start) * 1000
-        return RecommendResponse(
-            user_id=payload.user_id,
-            recommendations=recs,
-            latency_ms=round(latency, 2)
-        )
-        
+        return {"user_id": request.user_id, "recommendations": recs}
     except Exception as e:
-        logger.error(f"Error generating recs: {str(e)}")
+        print(f"Error processing user {request.user_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
-if __name__ == "__main__":
-    import uvicorn
-    # Run locally for debugging
-    uvicorn.run(app, host="0.0.0.0", port=8000)
