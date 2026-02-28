@@ -275,3 +275,8 @@ This repository represents the **deployment layer** of a full RetailRocket recom
 * Production inference
 
 ---
+
+## Author
+
+**Joshua Chukwuma**
+Machine Learning / AI Engineer
